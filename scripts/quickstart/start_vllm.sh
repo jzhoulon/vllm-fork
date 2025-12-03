@@ -28,13 +28,13 @@ Help() {
 model_path=/data/hf_models/DeepSeek-R1-Gaudi
 vllm_port=8688
 warmup_cache_path=/data/warmup_cache
-max_num_seqs=64
+max_num_seqs=128
 host=0.0.0.0
-max_model_len=16384
+max_model_len=8192 #16384
 max_num_prefill_seqs=1
 
 KV_CACHE_DTYPE=fp8_inc
-
+VLLM_DEEPSEEK_V32=true
 while getopts hw:u:p:l:b:c:m:sq flag; do
     case $flag in
     h) # display Help
@@ -131,7 +131,7 @@ if (( max_model_len <= 16384 )); then
 else
 	export VLLM_GPU_MEMORY_UTILIZATION=0.7
 fi
-export VLLM_GRAPH_RESERVED_MEM=0.2
+export VLLM_GRAPH_RESERVED_MEM=0.1
 export VLLM_GRAPH_PROMPT_RATIO=0
 export VLLM_MLA_DISABLE_REQUANTIZATION=0
 export VLLM_DELAYED_SAMPLING="true"
@@ -194,11 +194,17 @@ echo " environments are reset "
 
 env | grep VLLM
 
+#--enforce-eager \
 
-python3 -m vllm.entrypoints.openai.api_server --host $host --port $vllm_port \
+#HABANA_LOGS=./logs LOG_LEVEL_ALL=1 
+#PT_HPU_LAZY_MODE=1
+#VLLM_DEEPSEEK_V32=1
+#--enforce-eager \
+PT_HPU_LAZY_MODE=1 VLLM_DEEPSEEK_V32=1 python3 -m vllm.entrypoints.openai.api_server  --host $host --port $vllm_port \
 --block-size 128 \
 --model $model_path \
 --device hpu \
+--enforce-eager \
 --dtype bfloat16 \
 --kv-cache-dtype $KV_CACHE_DTYPE \
 --tensor-parallel-size 8 \

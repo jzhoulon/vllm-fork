@@ -151,7 +151,7 @@ def main(model_path: str, qmodel_path: str, input_scales_path: str) -> None:
                 if "model.layers.61" in name:
                     logger.debug(f"Ignoring {name}")
                     continue
-                elif "proj" in name and "scale_inv" in name:
+                elif ("proj" in name or "indexer" in name )and "scale_inv" in name:
                     weight_scale_name = name
                     weight_name = name[: -len("_scale_inv")]
                     logger.debug(f"Begin quantizing weight: {weight_name} with scale: {weight_scale_name}")
@@ -183,7 +183,7 @@ def main(model_path: str, qmodel_path: str, input_scales_path: str) -> None:
                         qtensor_mapping[input_scale_name] = filename
                     
                     logger.debug(f"Completed quantizing weight: {weight_name} with scale: {weight_scale_name}")
-                elif "proj" in name and not ("scale_inv" in name) and not ("eh_" in name):
+                elif ("proj" in name or "indexer" in name) and not ("scale_inv" in name) and not ("eh_" in name):
                     logger.debug(f"Ignoring {name}")
                     continue
                 else:

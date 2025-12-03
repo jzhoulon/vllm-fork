@@ -215,7 +215,7 @@ class LLMEngine:
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
     ) -> None:
-
+        print("vllm_config = ",vllm_config)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -275,12 +275,12 @@ class LLMEngine:
         self.input_registry = input_registry
         self.input_processor = input_registry.create_input_processor(
             self.model_config)
-
         self.model_executor = executor_class(vllm_config=vllm_config, )
-
+        print("self.model_config.runner_type = ",self.model_config.runner_type, "self.model_config = ", self.model_config)
         if self.model_config.runner_type != "pooling":
+            print("  prepare to init")
             self._initialize_kv_caches()
-
+        print("finish the init=======================================")
         # If usage stat is enabled, collect relevant info.
         if is_usage_stats_enabled():
             from vllm.model_executor.model_loader import (
@@ -422,6 +422,7 @@ class LLMEngine:
         The workers will determine the number of blocks in both the GPU cache
         and the swap CPU cache.
         """
+        print("_initialize_kv_caches--------------------------------")
         start = time.time()
         num_gpu_blocks, num_cpu_blocks = (
             self.model_executor.determine_num_available_blocks())
@@ -438,6 +439,7 @@ class LLMEngine:
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+        print("self.model_executor.initialize_cache==========")
         elapsed = time.time() - start
         logger.info(("init engine (profile, create kv cache, "
                      "warmup model) took %.2f seconds"), elapsed)
@@ -1130,7 +1132,7 @@ class LLMEngine:
                         else:
                             seq_group.metrics.model_execute_time = (
                                 o.model_execute_time)
-
+            print("self.model_config.runner_type = ",self.model_config.runner_type, "model config = ", self.model_config)
             if self.model_config.runner_type == "pooling":
                 self._process_sequence_group_outputs(seq_group, output)
             else:

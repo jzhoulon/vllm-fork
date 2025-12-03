@@ -785,7 +785,7 @@ class ModelConfig:
     def is_deepseek_mla(self) -> bool:
         return (hasattr(self.hf_text_config, "model_type")) \
                 and (self.hf_text_config.model_type in \
-                    ('deepseek_v2', 'deepseek_v3', 'deepseek_mtp', 'kimi_k2'))\
+                    ('deepseek_v2', 'deepseek_v3', 'deepseek_mtp', 'kimi_k2', 'deepseek_v32'))\
                 and (self.hf_text_config.kv_lora_rank is not None)
 
     def get_head_size(self) -> int:
@@ -1020,6 +1020,9 @@ class ModelConfig:
     def use_mla(self) -> bool:
         return self.is_deepseek_mla and not envs.VLLM_MLA_DISABLE
 
+    @property
+    def is_deepseek_v32(self) -> bool:
+        return hasattr(self.hf_config, "index_topk")
     @property
     def supported_runner_types(self) -> Set[RunnerType]:
         return {_TASK_RUNNER[task] for task in self.supported_tasks}

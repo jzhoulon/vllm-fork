@@ -174,6 +174,31 @@ class HPUMLAAttentionBackend(HPUAttentionBackend):
         return "HPU_MLA"
 
 
+class HPUDeepSeekV32SparseMLAAttentionBackend(HPUAttentionBackend):
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> Tuple[int, ...]:
+        # return (num_blocks, block_size,
+        #         head_size // 9 * 1), (num_blocks, block_size,
+        #                               head_size // 9 * 8)
+        # key cache is for jointed keys and values, value cache is for index cache in deepseek v32
+        return (num_blocks, block_size, head_size), (num_blocks, block_size, 128)
+
+    @staticmethod
+    def get_impl_cls() -> Type["HPUDeepSeekV32SparseMLAImpl"]:
+        return HPUDeepSeekV32SparseMLAImpl
+
+    @staticmethod
+    def get_name() -> str:
+        return "HPU_DeepSeekV32_SparseMLA"
+
+
+
 def _pipelined_pa(attn, value, block_groups, block_mapping, block_scales,
                   batch_size, matmul_av_op, batch2block_matmul_op,
                   block2batch_matmul_op):
@@ -228,10 +253,13 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
     batch_size = query.size(0)
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
-
+   # print("flat_pa_mla decode query 1 ====", query.shape)
+   # print("flat_pa_mla query value = ", query.to("cpu"))
     query = ops.batch2block(scale * query, block_mapping,
                             batch2block_matmul_op).unsqueeze(-2)
+   # print("flat_pa_mla after block query 2 = ", query.shape)
     key = keys_fetch_func(key_cache, block_list)
+   # print("flat_pa_mla key shape = ", key.shape)
     if value_cache is not None:
         value_cache = value_cache.unsqueeze(2)
         value = values_fetch_func(value_cache, block_list)
@@ -242,6 +270,8 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
+    #print("kv_heads = ", kv_heads, "q_heads = ", q_heads, "kye cache = ", key_cache.shape)
+    #print("key shape = ", key.shape)
     if kv_heads != q_heads:
         block_bias = block_bias.unsqueeze(1)
         query = query.unflatten(1, (kv_heads, -1))
@@ -250,9 +280,9 @@ def flat_pa_mla(query, key_cache, value_cache, block_list, block_mapping,
         key = key.transpose(3, 4)
     else:
         key = key.transpose(2, 3)
-
+    #print("after ---- query = ", query.shape, "key = ", key.shape)
     attn = matmul_qk_op(query, key)
-
+   # print("attn shape = ", attn.shape)
     if "fp32_softmax" in enabled_flags():
         attn = attn.float()
         htcore.mark_step()
@@ -309,6 +339,8 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     cross_block_scales: Optional[torch.Tensor] = None
     cross_block_usage: Optional[torch.Tensor] = None
     cross_attn_bias: Optional[torch.Tensor] = None
+    deepseek_v32_hidden_state:Optional[torch.Tensor] = None
+    deepseek_v32_qc:Optional[torch.Tensor] = None
 
 
 class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
@@ -384,7 +416,6 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         if output is not None:
             raise NotImplementedError(
                 "output is not yet supported for MLAImplBase")
-
         batch_size = hidden_states_or_q_c.shape[0]
 
         is_prefill = attn_metadata.is_prompt
@@ -419,7 +450,6 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
 
         block_indices = attn_metadata.block_indices
         block_offsets = attn_metadata.block_offsets
-
         latent_vec_k = torch.concat(
             (k_c_normed, k_pe.view(batch_size, -1, self.qk_rope_head_dim)),
             dim=-1)
@@ -467,6 +497,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
         v_padded = v_padded.view(batch_size, -1, self.num_heads,
                                  self.qk_head_dim)
+       # print("attention forward prefill bias = ", attn_metadata.attn_bias.to("cpu"))
         out = ops.prompt_attention(
             q,
             k,
@@ -485,6 +516,221 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         attn_output = attn_output[..., :v.shape[-1]]\
                 .reshape(batch_size, -1, self.num_heads * v.shape[-1])
 
+        return self.o_proj(attn_output)[0]
+
+    def _forward_decode(self, q_nope: torch.Tensor, q_pe: torch.Tensor,
+                        kv_cache: torch.Tensor,
+                        attn_metadata: HPUAttentionMetadata,
+                        batch_size: int) -> torch.Tensor:
+        q = torch.cat([q_nope, q_pe], dim=-1)
+ 
+        output = flat_pa_mla(
+            query=q,
+            key_cache=kv_cache[0],
+            value_cache=None,
+            block_list=attn_metadata.block_list,
+            block_mapping=attn_metadata.block_mapping,
+            block_bias=attn_metadata.attn_bias,
+            block_scales=attn_metadata.block_scales,
+            block_groups=attn_metadata.block_groups,
+            scale=self.scale,
+            matmul_qk_op=self.matmul_qk
+            if not self.VLLM_USE_FP8_MATMUL else self.matmul_qk_decode,
+            matmul_av_op=self.matmul_av
+            if not self.VLLM_USE_FP8_MATMUL else self.matmul_av_decode,
+            batch2block_matmul_op=self.batch2block_matmul,
+            block2batch_matmul_op=self.block2batch_matmul,
+            keys_fetch_func=self.latent_cache_k.fetch_from_cache
+            if not self.VLLM_USE_FP8_MATMUL else
+            self.latent_cache_k_nodeq.fetch_from_cache,
+            values_fetch_func=None,
+            kv_lora_rank=self.kv_lora_rank,
+            kv_in_fp8=self.VLLM_USE_FP8_MATMUL,
+        )
+        output = output.view(batch_size, 1, -1)
+        result = self._v_up_proj_and_o_proj(output)
+        result = result.view(batch_size, 1, -1)
+        return result
+
+class HPUDeepSeekV32SparseMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
+
+    def __init__(
+            self,
+            num_heads: int,
+            head_size: int,
+            scale: float,
+            num_kv_heads: int,
+            alibi_slopes: Optional[List[float]],
+            sliding_window: Optional[int],
+            kv_cache_dtype: str,
+            blocksparse_params: Optional[Dict[str, Any]],
+            logits_soft_cap: Optional[float],
+            attn_type: str,
+            # MLA Specific Arguments
+            **kwargs) -> None:
+        torch.nn.Module.__init__(self)
+        MLACommonImpl.__init__(self, num_heads, head_size, scale, num_kv_heads,
+                               alibi_slopes, sliding_window, kv_cache_dtype,
+                               blocksparse_params, logits_soft_cap, attn_type,
+                               **kwargs)
+
+        self.matmul_qk = Matmul()
+        self.softmax = Softmax()
+        self.matmul_av = Matmul()
+        self.batch2block_matmul = Matmul()
+        self.block2batch_matmul = Matmul()
+
+        self.VLLM_USE_FP8_MATMUL = os.environ.get(
+            "VLLM_USE_FP8_MATMUL", "false").lower() in ["true", "1"]
+
+        if self.VLLM_USE_FP8_MATMUL:
+            self.latent_cache_k_nodeq = VLLMKVCache()
+            self.latent_cache_k_nodeq = initialize_fp8_kv_cache(
+                self.latent_cache_k_nodeq)
+            self.matmul_qk_decode = initialize_fp8_matmul(self.matmul_qk)
+            self.matmul_av_decode = initialize_fp8_matmul(self.matmul_av)
+        else:
+            self.latent_cache_k = VLLMKVCache()
+
+        self.prefill_use_fusedsdpa = "fsdpa" in enabled_flags()
+        HPUFusedSDPA = kernels.fsdpa()
+        self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
+            else ModuleFusedSDPA(HPUFusedSDPA)
+
+        unsupported_features = [
+            alibi_slopes, sliding_window, blocksparse_params, logits_soft_cap
+        ]
+        if any(unsupported_features):
+            raise NotImplementedError(
+                "TritonMLAImpl does not support one of the following: "
+                "alibi_slopes, sliding_window, blocksparse_params, "
+                "logits_soft_cap")
+
+        if attn_type != AttentionType.DECODER:
+            raise NotImplementedError("Encoder self-attention and "
+                                      "encoder/decoder cross-attention "
+                                      "are not implemented for "
+                                      "TritonMLAImpl")
+
+    def forward(
+        self,
+        layer: AttentionLayer,
+        hidden_states_or_q_c: torch.Tensor,  # query in unified attn
+        k_c_normed: torch.Tensor,  # key in unified attn
+        k_pe: torch.Tensor,  # value in unified attn
+        kv_cache: torch.Tensor,
+        attn_metadata: HPUAttentionMetadata,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if output is not None:
+            raise NotImplementedError(
+                "output is not yet supported for MLAImplBase")
+        batch_size = hidden_states_or_q_c.shape[0]
+
+        is_prefill = attn_metadata.is_prompt
+
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+
+        # Restore head dim (for rotary embedding)
+        # k_pe = k_pe.unsqueeze(1)
+        assert hasattr(attn_metadata,
+                       "input_positions"), f"attn meta: {attn_metadata}"
+        if not is_prefill:
+            if envs.VLLM_MLA_PERFORM_MATRIX_ABSORPTION:
+                q_nope = self._q_proj_and_k_up_proj(hidden_states_or_q_c)
+                q_pe = torch.matmul(hidden_states_or_q_c, self.W_QR)\
+                    .view(-1, self.num_heads, self.qk_rope_head_dim)
+            else:
+                q_nope, q_pe = self._q_proj_and_k_up_proj(hidden_states_or_q_c)
+            input_positions = attn_metadata.input_positions.view(-1)
+            #print("attn rotary_emb = ", self.rotary_emb, "input_positions shape = ", input_positions.shape,"q_pe shape = ", q_pe.shape, "k_pe shape = ", k_pe.shape, "self.qk_rope_head_dim = ",self.qk_rope_head_dim)
+            q_pe, k_pe = \
+                self.rotary_emb(input_positions, q_pe, k_pe)
+        else:
+            q = self.q_proj(hidden_states_or_q_c)[0]\
+                .view(-1, self.num_heads, self.qk_head_dim)
+
+            q_pe = q[..., self.qk_nope_head_dim:]
+            input_positions = attn_metadata.input_positions.view(-1)
+            # TODO(lucas): there must be a nicer way to write this line
+            #print("attn rotary_emb = ", self.rotary_emb, "input_positions shape = ", input_positions.shape,"q_pe shape = ", q_pe.shape, "k_pe shape = ", k_pe.shape)
+  
+            q[..., self.qk_nope_head_dim:], k_pe = \
+                self.rotary_emb(input_positions, q_pe, k_pe)
+
+        block_indices = attn_metadata.block_indices
+        block_offsets = attn_metadata.block_offsets
+
+        latent_vec_k = torch.concat(
+            (k_c_normed, k_pe.view(batch_size, -1, self.qk_rope_head_dim)),
+            dim=-1)
+        latent_vec_k = latent_vec_k.view(
+            -1, self.qk_rope_head_dim + self.kv_lora_rank)
+        if is_prefill:
+            latent_vec_k = latent_vec_k.unflatten(0,
+                                                  (block_indices.size(0), -1))
+
+        # write the latent and rope to kv cache
+        if kv_cache is not None and len(kv_cache) == 2:
+            if not self.VLLM_USE_FP8_MATMUL:
+                self.latent_cache_k(latent_vec_k, kv_cache[0],
+                                    block_indices, block_offsets)
+                k_cache = kv_cache[0]
+            else:
+                k_cache = self.latent_cache_k_nodeq(latent_vec_k, kv_cache[0],
+                                                    block_indices,
+                                                    block_offsets)
+        if kv_cache is not None:
+            indexer_k_cache = kv_cache[1]
+        else:
+            indexer_k_cache = None
+        v_cache = None
+        if is_prefill:
+            #print("run prefill")
+            return self._forward_prefill(q, k_c_normed, k_pe, attn_metadata,
+                                         batch_size)
+        else:
+            #print("run decode")
+            return self._forward_decode(q_nope, q_pe, (k_cache, v_cache), attn_metadata,
+                                        batch_size)
+
+    def _forward_prefill(self, q: torch.Tensor, k_c_normed: torch.Tensor,
+                         k_pe: torch.Tensor,
+                         attn_metadata: HPUAttentionMetadata,
+                         batch_size: int) -> torch.Tensor:
+        kv_nope = self.kv_b_proj(k_c_normed)[0]\
+            .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv_nope\
+            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+
+        # For MLA the v head dim is smaller than qk head dim so we pad out
+        # v with 0s to match the qk head dim
+        v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
+                                           value=0)
+        q = q.view(batch_size, -1, self.num_heads, self.qk_head_dim)
+        k = k.view(batch_size, -1, self.num_heads, self.qk_head_dim)
+        v_padded = v_padded.view(batch_size, -1, self.num_heads,
+                                 self.qk_head_dim)
+        out = ops.prompt_attention(
+            q,
+            k,
+            v_padded,
+            attn_bias=attn_metadata.attn_bias,
+            p=0.0,
+            scale=self.scale,
+            matmul_qk_op=self.matmul_qk,
+            softmax_op=self.softmax,
+            matmul_av_op=self.matmul_av,
+            valid_seq_lengths=attn_metadata.seq_lens_tensor,
+            fsdpa_op=self.fused_scaled_dot_product_attention
+            if self.prefill_use_fusedsdpa else None,
+        )
+        attn_output = out.view(batch_size, -1, self.num_heads, q.shape[-1])
+        attn_output = attn_output[..., :v.shape[-1]]\
+                .reshape(batch_size, -1, self.num_heads * v.shape[-1])
+        #print("finish prefill")
         return self.o_proj(attn_output)[0]
 
     def _forward_decode(self, q_nope: torch.Tensor, q_pe: torch.Tensor,
@@ -519,7 +765,10 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         output = output.view(batch_size, 1, -1)
         result = self._v_up_proj_and_o_proj(output)
         result = result.view(batch_size, 1, -1)
+        print("finish decode")
         return result
+
+
 
 
 class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
