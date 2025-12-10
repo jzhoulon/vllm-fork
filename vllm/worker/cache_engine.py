@@ -64,11 +64,13 @@ class CacheEngine:
                                              self.block_size,
                                              model_config.is_attention_free,
                                              use_mla=model_config.use_mla)
-
+        print("Allocate gpu cache")
         # Initialize the cache.
         self.gpu_cache = self._allocate_kv_cache(
             self.num_gpu_blocks, self.device_config.device_type)
+        print("Allocate cpu cache")
         self.cpu_cache = self._allocate_kv_cache(self.num_cpu_blocks, "cpu")
+        print("finish allocate")
 
     def _allocate_kv_cache(
         self,
@@ -157,10 +159,12 @@ class CacheEngine:
             key_cache_block = cache_config.block_size * num_heads * head_size
             # For MLA there is no value cache, since the latent vector
             # is joint keys and values.
-            value_cache_block = key_cache_block if not model_config.use_mla else 0
-            total = num_attention_layers * (key_cache_block + value_cache_block)
+            value_cache_block = key_cache_block if (not model_config.use_mla or model_config.is_deepseek_v32 )else 0
+            total_key = num_attention_layers * key_cache_block             
+            total_value = num_attention_layers * value_cache_block
             dtype_size = get_dtype_size(dtype)
-            return dtype_size * total
+            dtype_value_size = get_dtype_size(dtype) if (not model_config.is_deepseek_v32) else get_dtype_size(torch.bfloat16)
+            return dtype_size * total_key + dtype_value_size * total_value
         key_cache_entry = num_heads * head_size
         if CacheEngine._align_cache(model_config):
             key_cache_entry = align_to_256bytes(key_cache_entry,
@@ -168,7 +172,7 @@ class CacheEngine:
 
         # For MLA there is no value cache, since the latent vector
         # is joint keys and values.
-        value_cache_entry = key_cache_entry if not model_config.use_mla else 0
+        value_cache_entry = key_cache_entry if (not model_config.use_mla or model_config.is_deepseek_v32) else 0
         total = num_attention_layers * cache_config.block_size * \
             (key_cache_entry + value_cache_entry)
 

@@ -22,7 +22,10 @@ router_weights = router_weights.to(dtype=dtype)
 # w12 = [torch.randn((hidden_dim, 2 * ffn_dim), dtype=dtype).to("hpu") for _ in range(num_experts)]
 # w3 = [torch.randn((ffn_dim, hidden_dim), dtype=dtype).to("hpu") for _ in range(num_experts)]
 w12 = [torch.randn((2 * ffn_dim, hidden_dim), dtype=dtype).to("hpu") for _ in range(num_experts)]
+
+
 w3 = [torch.randn((hidden_dim, ffn_dim), dtype=dtype).to("hpu") for _ in range(num_experts)]
+
 
 print(f"hidden_states.shape: {hidden_states.shape}, device: {hidden_states.device}, dtype: {hidden_states.dtype}")
 print(f"expert_routing_table.shape: {expert_routing_table.shape}, device: {expert_routing_table.device}, dtype: {expert_routing_table.dtype}")
@@ -36,6 +39,7 @@ result = torch.ops.hpu.mixture_of_experts(
     router_weights.to("hpu"),
     w12,
     w3,
+
     permuted_weights,
     activation,
     0,

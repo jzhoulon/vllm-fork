@@ -350,7 +350,6 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
-
         cache_block_size = self.get_cache_block_size_bytes()
         graph_reserved_mem = (float(
             os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
@@ -403,7 +402,6 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
         self.model_runner.bucketing_ctx.num_hpu_blocks = num_gpu_blocks // self.parallel_config.pipeline_parallel_size
-
         with HabanaMemoryProfiler() as m:
             self._init_cache_engine()
             torch.hpu.synchronize()
@@ -414,6 +412,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
+        
         self.cache_engine = [
             HPUCacheEngine(self.cache_config, self.model_config,
                            self.parallel_config, self.device_config)
@@ -625,14 +624,12 @@ class HPUCacheEngine(CacheEngine):
         """Allocates KV cache on the specified device."""
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)
-
         if len(kv_cache_shape) == 2:
             k_cache_shape = kv_cache_shape[0]
             v_cache_shape = kv_cache_shape[1]
         else:
             k_cache_shape = kv_cache_shape
             v_cache_shape = kv_cache_shape
-
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
         dtype = self.dtype
         if device != 'hpu' and not is_fake_hpu() \
@@ -641,9 +638,16 @@ class HPUCacheEngine(CacheEngine):
         for _ in range(self.num_attention_layers):
             key_cache = torch.zeros(k_cache_shape, dtype=dtype, device=device)
             if v_cache_shape is not None:
-                value_cache = torch.zeros(v_cache_shape,
-                                          dtype=dtype,
-                                          device=device)
+                is_deepseek_v32 = os.environ.get("VLLM_DEEPSEEK_V32", False)
+                if is_deepseek_v32:
+                  value_cache = torch.zeros(v_cache_shape,
+                                            dtype=torch.bfloat16,
+                                            device=device)
+                else:
+                  value_cache = torch.zeros(v_cache_shape,
+                                            dtype=dtype,
+                                            device=device)
+ 
             else:
                 value_cache = None
             kv_layer = (key_cache, value_cache)

@@ -37,7 +37,7 @@ def convert_files(input_path, output_path):
             for k in tensor_file.keys():
                 tensor = tensor_file.get_tensor(k)
                 # tensor = tensor.squeeze(-1)
-                if "proj" in k:
+                if ("proj" or "indexer") in k :
                     if k.endswith("weight"):
                         tensor = (tensor.float() * 240.0 / 448.0).to(
                             torch.float8_e4m3fn

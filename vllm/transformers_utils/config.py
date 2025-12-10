@@ -28,6 +28,7 @@ from vllm.envs import VLLM_USE_MODELSCOPE
 from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
+from vllm.transformers_utils.configs.deepseek_v3 import DeepseekV3Config
 from vllm.transformers_utils.configs import (ChatGLMConfig, Cohere2Config,
                                              DbrxConfig, DeepseekVLV2Config,
                                              EAGLEConfig, ExaoneConfig,
@@ -62,6 +63,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     "cohere2": Cohere2Config,
     "dbrx": DbrxConfig,
     "deepseek_vl_v2": DeepseekVLV2Config,
+    "deepseek_v32": DeepseekV3Config,
     "mpt": MPTConfig,
     "RefinedWeb": RWConfig,  # For tiiuae/falcon-40b(-instruct)
     "RefinedWebModel": RWConfig,  # For tiiuae/falcon-7b(-instruct)

@@ -8,7 +8,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 import logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # CONSTANTS
@@ -147,11 +147,13 @@ def main(model_path: str, qmodel_path: str, input_scales_path: str) -> None:
 
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
+                t = f.get_tensor(name)
+                print("name = ",name, "dtype = ", t.dtype)
                 logger.debug(f"[{i+1}/{len(all_weight_filename)}] Processing {name}")
                 if "model.layers.61" in name:
                     logger.debug(f"Ignoring {name}")
                     continue
-                elif "proj" in name and "scale_inv" in name:
+                elif ("proj" in name or "indexer" in name )and "scale_inv" in name:
                     weight_scale_name = name
                     weight_name = name[: -len("_scale_inv")]
                     logger.debug(f"Begin quantizing weight: {weight_name} with scale: {weight_scale_name}")
@@ -183,7 +185,7 @@ def main(model_path: str, qmodel_path: str, input_scales_path: str) -> None:
                         qtensor_mapping[input_scale_name] = filename
                     
                     logger.debug(f"Completed quantizing weight: {weight_name} with scale: {weight_scale_name}")
-                elif "proj" in name and not ("scale_inv" in name) and not ("eh_" in name):
+                elif ("proj" in name or "indexer" in name) and not ("scale_inv" in name) and not ("eh_" in name) and not ("k_norm" in name) and not("weights_proj" in name):
                     logger.debug(f"Ignoring {name}")
                     continue
                 else:
