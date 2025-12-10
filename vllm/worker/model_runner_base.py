@@ -226,7 +226,7 @@ class ModelRunnerBase(ABC, Generic[T]):
         not allowed to communicate with other workers or devices.
         """
         raise NotImplementedError
-    @abstractmethod
+
     def prepare_model_input_align_worker(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],

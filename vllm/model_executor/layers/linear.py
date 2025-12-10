@@ -246,9 +246,8 @@ class ReplicatedLinear(LinearBase):
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
-        print("param.size =======",param.size(), "loaded_weight size = ", loaded_weight.size())
+
         assert param.size() == loaded_weight.size()
-        
         param.data.copy_(loaded_weight)
 
     def forward(self,

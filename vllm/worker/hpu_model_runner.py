@@ -375,6 +375,7 @@ class HpuModelAdapter:
         mask = mask >= metadata.block_usage.unsqueeze(-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
+
         if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(metadata.block_groups,
                                                         num_classes=batch_size)
@@ -1871,8 +1872,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             'block_scales',
             'block_groups',
             'input_positions',
-            'deepseek_v32_hidden_state',
-            'deepseek_v32_qc',
         ])
         return attention_metadata
 
@@ -2026,7 +2025,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             profiler.start()
         for time_index in range(times):
             inputs = self.prepare_model_input_align_worker(
-                seqs, align_worker=align_worker, accepted_token_id=None)
+                seqs, align_worker=align_worker)
             additional_inputs = {}
             if self.model_type in ("medusa", "mlp_speculator", "eagle",
                                    "deepseek_mtp"):
@@ -2256,7 +2255,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         compile_only_mode_context = functools.partial(bc.env_setting,
                                                       "PT_COMPILE_ONLY_MODE",
                                                       True)
-        can_use_compile_only_mode = False ## topk accuracy issue
+        can_use_compile_only_mode = True
         try:
             with compile_only_mode_context():
                 pass

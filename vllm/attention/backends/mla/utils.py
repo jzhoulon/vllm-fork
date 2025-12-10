@@ -256,6 +256,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             q_nope, q_pe = self.q_proj(x)[0]\
                 .view(-1, self.num_heads, self.qk_head_dim)\
                 .split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
             # Convert from (B, N, P) to (N, B, P)
             q_nope = q_nope.transpose(0, 1)
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)

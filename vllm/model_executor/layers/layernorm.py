@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
-import torch.nn.functional as F
 
 
 @CustomOp.register("rms_norm")
@@ -223,22 +222,3 @@ class GemmaRMSNorm(CustomOp):
                 self.forward_static)
             self._is_compiled = True
         return self.forward_native(x, residual)
-
-class LayerNorm(nn.Module):
-    """
-    Layer Normalization.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        return F.layer_norm(
-            x.float(), (self.dim,), self.weight, self.bias, self.eps
-        ).type_as(x)
-
-

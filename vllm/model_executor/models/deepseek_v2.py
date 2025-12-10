@@ -23,11 +23,11 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
-import math
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-import habana_frameworks.torch as htorch
+
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -36,7 +36,7 @@ from vllm.distributed import (get_pp_group,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                ReplicatedLinear,
@@ -52,7 +52,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils import cdiv, direct_register_custom_op
 
 from .interfaces import SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
@@ -60,22 +59,6 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 is_hpu = current_platform.is_hpu()
-from vllm_hpu_extension.cache_ops import insert_or_update_cache #VLLMKVCache
-from vllm_hpu_extension.utils import Matmul
-import vllm_hpu_extension.ops as ops
-
-class IndexerVLLMKVCache(torch.nn.Module):
-
-    def __init__(self):
-        super(IndexerVLLMKVCache, self).__init__()
-
-    def forward(self, input, cache, block_indices, block_offset):
-        insert_or_update_cache(input, cache, block_indices, block_offset)
-        return cache
-
-    def fetch_from_cache(self, cache, blocks):
-        return cache.index_select(0, blocks)
-
 
 
 class DeepseekV2MLP(nn.Module):
@@ -228,7 +211,6 @@ class DeepseekV2Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        model_config: Optional[ModelConfig]=None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -248,7 +230,6 @@ class DeepseekV2Attention(nn.Module):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(self.hidden_size,
@@ -394,279 +375,6 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
-class Indexer(nn.Module):
-    def __init__(
-        self,
-        model_config: ModelConfig,
-        config: PretrainedConfig,
-        hidden_size: int,
-        q_lora_rank: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.model_config=model_config
-        self.config = config
-        # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
-        self.topk_tokens = config.index_topk
-        self.n_head = config.index_n_heads  # 64
-        self.head_dim = config.index_head_dim  # 128
-        self.rope_dim = config.qk_rope_head_dim  # 64
-        self.q_lora_rank = q_lora_rank  # 1536
-        # no tensor parallel, just replicated
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.head_dim * self.n_head,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wq_b",
-        )
-        self.wk = ReplicatedLinear(
-            hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wk",
-        )
-        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
-            hidden_size, self.n_head, quant_config=None, prefix=f"{prefix}.weights_proj"
-        )
-        self.softmax_scale = self.head_dim**-0.5
-
-        #self.scale_fmt = "ue8m0"
-       # self.quant_block_size = 128  # TODO: get from config
-
-        # NOTE: (zyongye) we use fp8 naive cache,
-        #       where we store value in fp8 and scale in fp32
-        #       per self.quant_block_size element
-        self.max_model_len = model_config.max_model_len
-        self.prefix = prefix
-
-        self.max_total_seq_len = model_config.max_model_len*2
-        self.cache_op = IndexerVLLMKVCache()
-        
-        self.matmul_qk = Matmul()
-        self.batch2block_matmul = Matmul()
-        self.block2batch_matmul = Matmul()
-
-
-    #'''
-    def sparse_attn_indexer(
-        self,
-        hidden_states: torch.Tensor,
-        #k_cache_prefix: str,
-        kv_cache: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        weights: torch.Tensor,
-        #quant_block_size: int,
-        #scale_fmt: Optional[str],
-        topk_tokens: int,
-        head_dim: int,
-        max_model_len: int,
-        total_seq_lens: int,
-        attn_metadata: AttentionMetadata,
-        #k_cache_op:VLLMKVCache,
-    ) -> torch.Tensor:
-
-        # careful! this will be None in dummy run
-        is_prefill = attn_metadata.is_prompt
-       # print("topk_indices_buffer shape = ", topk_indices_buffer.shape)
-        #profile run
-        if kv_cache is None:
-            return  
-        #cache_op = VLLMKVCache()
-        if is_prefill:
-            block_indices = attn_metadata.block_indices
-            block_offsets = attn_metadata.block_offsets
-            if kv_cache is not  None:
-               key = k.squeeze()
-               key = key.unflatten(0,(block_indices.size(0), -1))
-               kv_cache = self.cache_op(key, kv_cache, block_indices, block_offsets)
-           # print("k shape = ", k.unsqueeze(1).shape, "q shape = ", q.transpose(-1, -2).shape)  
-            logits = torch.matmul(k.unsqueeze(1), q.transpose(-1, -2))
-           # relu = nn.ReLU(inplace=True)
-            #logits = relu(logits)
-            logits1 = logits
-            logits.clamp_min_(0)
-            logits2 = logits
-          #  print("logits 1 = ", logits.shape, "weight shape = ", weights.transpose(-1,-2).shape)
-            logits = logits.transpose(-1,-2)* weights
-            logits3 = logits
-            logits = logits.transpose(-1,-2).sum(dim=-1) #
-            
-            print("logits shape = ", logits.shape, "topk num = ", min(topk_tokens, logits.shape[-1]))
-            topk_indices_cpu = logits.topk(min(topk_tokens, logits.shape[-1]), dim=-1) [1]
-            topk_indices_cpu2 = topk_indices_cpu.to("cpu") #.indices
-            print("topk_indices_hpu = ", topk_indices_cpu2)
-            logits_cpu = logits.to("cpu")
-            topk_indices_cpu = logits_cpu.topk(min(topk_tokens, logits.shape[-1]), dim=-1) [1] #.indices
-            print("topk_indices_cpu 2= ", topk_indices_cpu)
-            bs, seq_len, _ = hidden_states.shape
-            num_heads = q.shape[1]
-           # keep_mask = torch.full_like(logits, -math.inf)
- 
-            keep_mask = torch.full_like(logits.to("cpu"), -math.inf)
-            keep_mask.scatter_(-1, topk_indices_cpu2, 0.0)
-            keep_mask = keep_mask.unsqueeze(1).to("hpu")
-            attn_bias = None
-            if attn_metadata.attn_bias is None:
-                attn_bias = keep_mask
-            else:
-                attn_bias = attn_metadata.attn_bias
-                attn_bias.add_(keep_mask)
-            attn_metadata = attn_metadata._replace(attn_bias=attn_bias)
-          #  print("set attn bias -----------------", attn_bias)
-          #  print("index attn_metadata bias = ", attn_metadata.attn_bias, "attn_metadata id ", id(attn_metadata))
-           # topk_indices_buffer = topk_indices_cpu.squeeze().to("hpu")
-           # print("topk_indices_buffer in index =", topk_indices_buffer.to("cpu"))
-          #  topk_indices= topk_indices.to(dtype=torch.int32)
-            #print("topk_indices_buffer = ", topk_indices_buffer)
-        else:
-
-            #return topk_indices_buffer
-            block_indices = attn_metadata.block_indices
-            block_offsets = attn_metadata.block_offsets
-            block_list = attn_metadata.block_list
-           # htorch.core.mark_step()
-           # torch.hpu.synchronize()
- 
-            kv_cache = self.cache_op(k, kv_cache, block_indices, block_offsets)
-            k = self.cache_op.fetch_from_cache(kv_cache, block_list).unsqueeze(-2)
-            #htorch.core.mark_step()
-            #torch.hpu.synchronize()
- 
-            q_heads = q.size(1)
-            kv_heads = 1
-           # q1 = q.to("cpu")
-           # htorch.core.mark_step()
-           # torch.hpu.synchronize()
- 
-            shape = tuple(q.shape)
-           # print("block_mapping shape = ", attn_metadata.block_mapping.shape)
-           # print("q b2b 1 shape = ", q.view(shape[0], -1).shape)
-           # print("q b2b shape = ", q.view(shape[0], -1).view(-1, *shape[1:]).shape)
-           # print("q_cpu = ", q1)
-            query = ops.batch2block(q, attn_metadata.block_mapping,
-                        self.batch2block_matmul).unsqueeze(-2)
-           # htorch.core.mark_step()
-           # torch.hpu.synchronize()
- 
-
-            #query_cpu = query.to("cpu")
-           # print("decode q after batch2block shape = ", query.shape)
-            key = k.transpose(1, 2)
-            block_bias = attn_metadata.attn_bias
-            block_bias = block_bias.view(key.size(0), 1, 1, -1)
-            if kv_heads != q_heads:
-                block_bias = block_bias.unsqueeze(1)
-                query = query.unflatten(1, (kv_heads, -1))
-                key = key.unflatten(1, (kv_heads, 1))
-                key = key.transpose(3, 4)
-            else:
-                key = key.transpose(2, 3)
-          #  key_cpu = key.to("cpu")
-          #  print("decode before mamtul query shape = ", query.shape, "key shape = ", key.shape)
-           # htorch.core.mark_step()
-           # torch.hpu.synchronize()
- 
-            logits = self.matmul_qk(query, key)
-        #    print("decode logits shape = ", logits.shape, "weight shape = ", weights.shape)
-          #  logits_cpu = logits.to("cpu")
-            weights = ops.batch2block(weights, attn_metadata.block_mapping,
-                        self.batch2block_matmul) 
-         #   print("weights shape after b2b = ", weights.shape)
-           # weights_cpu = weights.to("cpu")
-          #  htorch.core.mark_step()
-          #  torch.hpu.synchronize()
- 
- 
-            logits = logits * weights.unsqueeze(-1)
-            #logits_cpu = logits.to("cpu")
-          #  print("decode logits before sum", logits.shape)
-            logits = logits.sum(dim=2)
-          #  htorch.core.mark_step()
-          #  torch.hpu.synchronize()
- 
-           # print("decode logits shape after sum = ", logits.shape)
-            #print("decode block bias shape = ",block_bias.shape )
-            logits = logits.to("cpu")
-            topk_indices_cpu = logits.topk(min(topk_tokens, logits.shape[-1]), dim=-1) [1] #.indices
-            bs, seq_len, _ = hidden_states.shape
-            keep_mask = torch.full_like(logits, -math.inf)
-            keep_mask.scatter_(-1, topk_indices_cpu, 0.0)
-            keep_mask = keep_mask.unsqueeze(1).to("hpu")
-            #print("block_bias shape =", block_bias.shape, "attn_ bias.shape = ", attn_metadata.attn_bias.shape, "keep_mask shape = ", keep_mask.shape)
-            block_bias.add_(keep_mask)
-            attn_metadata = attn_metadata._replace(attn_bias=block_bias.squeeze())
- 
-   
-    def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb, k_cache, attn_metadata
-    ) -> torch.Tensor:
-     #   print("qr shape = ", qr.shape)
-
-
-
-       # x = torch.rand(1,3712,3712, device="hpu")
-       # print("x shape = ", x.shape)
-       # indices_cpu = x.to("cpu").topk(2048, dim=-1)[1]
-       # print("indexer indices_cpu = ", indices_cpu)
-       # indices_hpu = x.topk(2048, dim=-1)[1].to("cpu")
-       # print("indexer indices_hpu = ", indices_hpu)
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
-        #htorch.core.mark_step()
-        #torch.hpu.synchronize()
- 
-        k, _ = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
-       # htorch.core.mark_step()
-       # torch.hpu.synchronize()
- 
-      #  print("indexer rotary_emb = ", rotary_emb, "position shape = ", positions.shape, "q_pe = ", q_pe.shape, "k_pe shape = ", k_pe.shape, "k_pe 2 = ", k_pe.squeeze().unsqueeze(1).shape, "self.rope_dim = ", self.rope_dim)
-        k_pe = k_pe.view(-1, 1, self.rope_dim)
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
-        q = torch.cat([q_pe, q_nope], dim=-1)
-    #    htorch.core.mark_step()
-    #    torch.hpu.synchronize()
- 
-        k = torch.cat([k_pe.squeeze(), k_nope.squeeze()], dim=-1)
-        k = k.unsqueeze(0)
-        weights, _ = self.weights_proj(hidden_states)
-        weights = (
-            weights.unsqueeze(-1) * self.softmax_scale * self.n_head**-0.5
-        )
-      #  htorch.core.mark_step()
-     #   torch.hpu.synchronize()
- 
-
-        #weights = weights.squeeze(-1)
-        return self.sparse_attn_indexer(
-            hidden_states,
-            #self.k_cache.prefix,
-            k_cache,
-            q,
-            k,
-            weights,
-           # self.quant_block_size,
-           # self.scale_fmt,
-            self.topk_tokens,
-            self.head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
-            attn_metadata,
-            #self.cache_op,
-        )
-
 class DeepseekV2MLAAttention(nn.Module):
     """
     Main reference: DeepseekV2 paper, and FlashInfer Implementation
@@ -688,7 +396,6 @@ class DeepseekV2MLAAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
-        model_config: Optional[ModelConfig]=None,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -762,33 +469,11 @@ class DeepseekV2MLAAttention(nn.Module):
                                    base=rope_theta,
                                    rope_scaling=rope_scaling,
                                    is_neox_style=False)
-        self.rotary_emb_indexer = get_rope(qk_rope_head_dim,
-                                   rotary_dim=qk_rope_head_dim,
-                                   max_position=max_position_embeddings,
-                                   base=rope_theta,
-                                   rope_scaling=rope_scaling,
-                                   is_neox_style=False)
-
- 
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
             scaling_factor = rope_scaling["factor"]
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
-        self.is_v32 = hasattr(config, "index_topk")
-
-        if self.is_v32:
-            self.indexer = Indexer(
-                model_config,
-                config,
-                hidden_size,
-                q_lora_rank,
-                quant_config,
-                cache_config,
-                f"{prefix}.indexer",
-            )
-        else:
-            self.indexer = None
 
         self.mla_attn = Attention(
             num_heads=self.num_local_heads,
@@ -810,12 +495,13 @@ class DeepseekV2MLAAttention(nn.Module):
             q_proj=self.q_proj if self.q_lora_rank is None else self.q_b_proj,
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
-            )
+        )
 
         self.prefix = prefix
         self.debug_layer_idx = int(self.prefix.split(".")[-2])
 
-    def forward( self,
+    def forward(
+        self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -824,19 +510,8 @@ class DeepseekV2MLAAttention(nn.Module):
         if self.q_lora_rank is not None:
             ckq = self.q_a_proj(hidden_states)[0]
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
-            if kv_cache is not None:
-              indexer_k_cache = kv_cache[1]
-            else:
-              indexer_k_cache = None
-            input_positions = attn_metadata.input_positions.view(-1)
-            if self.indexer is not None:
-              self.indexer(hidden_states, hidden_states_or_q_c, input_positions, self.rotary_emb_indexer, indexer_k_cache, attn_metadata)
-          #  htorch.core.mark_step()
-          #  torch.hpu.synchronize()
- 
         else:
             hidden_states_or_q_c = hidden_states
-        q_cpu = hidden_states_or_q_c.to("cpu")
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
@@ -880,7 +555,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            model_config=model_config,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -915,7 +589,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -953,8 +626,6 @@ class DeepseekV2Model(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.is_v32 = hasattr(config, "index_topk")
-
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -973,8 +644,7 @@ class DeepseekV2Model(nn.Module):
                 cache_config=cache_config,
                 quant_config=quant_config,
             ),
-            prefix=f"{prefix}.layers",
-        )
+            prefix=f"{prefix}.layers")
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

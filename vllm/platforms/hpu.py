@@ -4,11 +4,9 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
-import habana_frameworks.torch as htorch
 
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.utils import is_fake_hpu
 
 from .interface import Platform, PlatformEnum, _Backend
 
@@ -27,20 +25,15 @@ class HpuPlatform(Platform):
     dispatch_key: str = "HPU"
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
-    simple_compile_backend: str = "hpu_backend" if not is_fake_hpu(
-    ) and not htorch.utils.internal.is_lazy() else "inductor"
     supported_quantization: list[str] = ["fp8", "inc", "awq_hpu", "gptq_hpu"]
+
     @classmethod
     def get_attn_backend_cls(cls, selected_backend: _Backend, head_size: int,
                              dtype: torch.dtype, kv_cache_dtype: Optional[str],
                              block_size: int, use_v1: bool,
                              use_mla: bool) -> str:
-        is_deepseek_v32 = os.environ.get("VLLM_DEEPSEEK_V32", False)
-        print("is_deepseek_v32 ===============", is_deepseek_v32)
         logger.info("Using HPUAttention backend.")
-        if use_mla and is_deepseek_v32:
-            return "vllm.attention.backends.hpu_attn.HPUDeepSeekV32SparseMLAAttentionBackend"
-        elif use_mla:
+        if use_mla:
             return "vllm.attention.backends.hpu_attn.HPUMLAAttentionBackend"
         else:
             return "vllm.attention.backends.hpu_attn.HPUAttentionBackend"

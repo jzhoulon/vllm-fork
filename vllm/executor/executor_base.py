@@ -117,10 +117,9 @@ class ExecutorBase(ABC):
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
-        print("initialize_cache 1=============")
+
         self.collective_rpc("initialize_cache",
                             args=(num_gpu_blocks, num_cpu_blocks))
-        print("initialize_cache 2==============")
 
     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
         """
