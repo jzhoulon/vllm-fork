@@ -639,7 +639,7 @@ class Indexer(nn.Module):
             #print("block_bias shape =", block_bias.shape, "attn_ bias.shape = ", attn_metadata.attn_bias.shape, "keep_mask shape = ", keep_mask.shape)
            # print("block_bias = ", block_bias)
            # print("keep_mask = ", keep_mask)
-            #block_bias.add_(keep_mask)
+            block_bias.add_(keep_mask)
             attn_metadata = attn_metadata._replace(attn_bias=block_bias.squeeze())
  
    
