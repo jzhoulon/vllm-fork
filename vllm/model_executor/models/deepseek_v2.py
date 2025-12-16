@@ -615,8 +615,13 @@ class Indexer(nn.Module):
             logits = logits.sum(dim=2)
             block_groups = attn_metadata.block_groups
             block_usage = attn_metadata.block_usage
-            keep_mask = torch.full_like(logits, -math.inf)
+
+            logits = logits.sum(dim=2)
+            block_groups = attn_metadata.block_groups
+            block_usage = attn_metadata.block_usage
+            keep_mask = torch.full_like(logits, 0)
             #print("logits = ", logits)
+            #print("keep mask shape = ", keep_mask.shape)
             for batch_idx in range(batch_size):
                 idx = block_groups == batch_idx
                 batch_block_indices = torch.nonzero(idx, as_tuple=False).squeeze(-1)
@@ -625,21 +630,20 @@ class Indexer(nn.Module):
                 result = torch.index_select(logits, dim=0, index=batch_block_list)
    #             print("result shape = ", result.shape)
                 if result.shape[0] != 0:
-                   #print("result = ", result)
-                   result2 = result.view( -1)
+
+                   #keep_mask1 = torch.index_select(keep_mask, dim=0, index=batch_block_list)
+                   #result.add_(keep_mask1.squeeze())
+                   result2 = result.flatten()
                    keep_mask2 = torch.full_like(result2, -math.inf)
-                   topk_result_indice = result2.topk(min(topk_tokens, result.shape[0]), dim=-1)[1]
+                   topk_result_indice = result2.topk(min(topk_tokens, result2.shape[0]), dim=-1)[1]
                    keep_mask2.scatter_(-1, topk_result_indice, 0.0)
                    keep_mask2 = keep_mask2.view(result.shape)
                    keep_mask.index_copy_(0, batch_block_list, keep_mask2)
-                  #topk_result_indice = result.reshape(1,).topk(min(topk_tokens, result.shape[-1]))[1]
-                  #print("topk_result_indice shape = ", topk_result_indice.shape)
-        
             keep_mask = keep_mask.unsqueeze(1)#.to("hpu")
             #print("block_bias shape =", block_bias.shape, "attn_ bias.shape = ", attn_metadata.attn_bias.shape, "keep_mask shape = ", keep_mask.shape)
            # print("block_bias = ", block_bias)
            # print("keep_mask = ", keep_mask)
-            block_bias.add_(keep_mask)
+         #   block_bias.add_(keep_mask)
             attn_metadata = attn_metadata._replace(attn_bias=block_bias.squeeze())
  
    
